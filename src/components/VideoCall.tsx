@@ -96,7 +96,7 @@ export default function MultiVideoPage() {
   const joinRoom = async () => {
     if (!roomId) return alert("Enter Room ID");
 
-    const stream = await setupLocalStream();
+    const stream : any = await setupLocalStream();
     const channel = supabase.channel(roomId, {
       config: { broadcast: { self: false } },
     });
