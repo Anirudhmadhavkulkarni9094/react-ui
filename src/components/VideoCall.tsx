@@ -4,8 +4,6 @@ import { useRef, useState } from "react";
 import { createClient } from "@/lib/Client";
 import { v4 as uuidv4 } from "uuid";
 
-
-
 const supabase = createClient();
 
 export default function MultiVideoPage() {
@@ -14,21 +12,38 @@ export default function MultiVideoPage() {
   const [peers, setPeers] = useState<{ [id: string]: MediaStream }>({});
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
 
+  const [isMuted, setIsMuted] = useState(false);
+  const [isCameraOff, setIsCameraOff] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const peerConnections = useRef<{ [peerId: string]: RTCPeerConnection }>({});
   const peerId = useRef(uuidv4());
   const channelRef = useRef<any>(null);
 
   // --- Setup Local Media ---
-  const setupLocalStream = async () => {
+ const setupLocalStream = async () => {
+  try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: true,
       audio: true,
     });
     setLocalStream(stream);
-    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+
+    // wait for React to render video
+    setTimeout(() => {
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+    }, 100);
+
     return stream;
-  };
+  } catch (err) {
+    console.error("Camera/mic permission denied:", err);
+    alert("Please allow camera and microphone access.");
+  }
+};
+
 
   // --- Create Peer Connection ---
   const createPeerConnection = (targetId: string, stream: MediaStream) => {
@@ -91,12 +106,8 @@ export default function MultiVideoPage() {
       const msg = JSON.parse(payload);
       if (!msg || msg.from === peerId.current) return;
 
-      console.log("Got message:", msg.type, "from", msg.from);
-
       switch (msg.type) {
-        // 🟢 New user joined
         case "join": {
-          console.log("Creating offer for", msg.from);
           const pc = createPeerConnection(msg.from, stream);
           const offer = await pc.createOffer({
             offerToReceiveVideo: true,
@@ -112,10 +123,8 @@ export default function MultiVideoPage() {
           break;
         }
 
-        // 🟢 Offer received
         case "offer": {
           if (msg.to !== peerId.current) return;
-          console.log("Received offer from", msg.from);
           const pc = createPeerConnection(msg.from, stream);
           await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
           const answer = await pc.createAnswer();
@@ -129,10 +138,8 @@ export default function MultiVideoPage() {
           break;
         }
 
-        // 🟢 Answer received
         case "answer": {
           if (msg.to !== peerId.current) return;
-          console.log("Received answer from", msg.from);
           const pc = peerConnections.current[msg.from];
           if (pc && !pc.currentRemoteDescription) {
             await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
@@ -140,7 +147,6 @@ export default function MultiVideoPage() {
           break;
         }
 
-        // 🧊 ICE Candidate exchange
         case "ice-candidate": {
           if (msg.to !== peerId.current) return;
           const pc = peerConnections.current[msg.from];
@@ -148,9 +154,7 @@ export default function MultiVideoPage() {
           break;
         }
 
-        // 🚪 Handle Leave
         case "leave": {
-          console.log("Peer left:", msg.from);
           const pc = peerConnections.current[msg.from];
           if (pc) pc.close();
           delete peerConnections.current[msg.from];
@@ -164,7 +168,6 @@ export default function MultiVideoPage() {
       }
     });
 
-    // ✅ Subscribe to room
     await channel.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
         console.log("✅ Joined room:", roomId);
@@ -176,7 +179,6 @@ export default function MultiVideoPage() {
 
   // --- Leave Room ---
   const leaveRoom = async () => {
-    console.log("Leaving room...");
     localStream?.getTracks().forEach((t) => t.stop());
     Object.values(peerConnections.current).forEach((pc) => pc.close());
     peerConnections.current = {};
@@ -184,7 +186,62 @@ export default function MultiVideoPage() {
     await channelRef.current?.unsubscribe();
     setJoined(false);
     setPeers({});
+    setLocalStream(null);
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
+  };
+
+  // --- Toggle Mic ---
+  const toggleMic = () => {
+    if (!localStream) return;
+    localStream.getAudioTracks().forEach((track) => (track.enabled = !track.enabled));
+    setIsMuted((prev) => !prev);
+  };
+
+  // --- Toggle Camera ---
+  const toggleCamera = async () => {
+    if (!localStream) return;
+    const videoTrack = localStream.getVideoTracks()[0];
+    if (!isCameraOff) {
+      videoTrack.stop();
+      setIsCameraOff(true);
+    } else {
+      const newStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const newTrack = newStream.getVideoTracks()[0];
+      const sender = Object.values(peerConnections.current)
+        .map((pc) => pc.getSenders().find((s) => s.track?.kind === "video"))
+        .find(Boolean);
+      sender?.replaceTrack(newTrack);
+      localStream.removeTrack(videoTrack);
+      localStream.addTrack(newTrack);
+      if (localVideoRef.current) localVideoRef.current.srcObject = localStream;
+      setIsCameraOff(false);
+    }
+  };
+
+  // --- Screen Share ---
+  const toggleScreenShare = async () => {
+    if (!peerConnections.current) return;
+
+    if (!isScreenSharing) {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const screenTrack = screenStream.getVideoTracks()[0];
+      for (const pc of Object.values(peerConnections.current)) {
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+        sender?.replaceTrack(screenTrack);
+      }
+      if (localVideoRef.current) localVideoRef.current.srcObject = screenStream;
+      screenTrack.onended = () => toggleScreenShare();
+      setIsScreenSharing(true);
+    } else {
+      const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const cameraTrack = cameraStream.getVideoTracks()[0];
+      for (const pc of Object.values(peerConnections.current)) {
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+        sender?.replaceTrack(cameraTrack);
+      }
+      if (localVideoRef.current) localVideoRef.current.srcObject = localStream;
+      setIsScreenSharing(false);
+    }
   };
 
   // --- UI ---
@@ -211,9 +268,9 @@ export default function MultiVideoPage() {
         </div>
       ) : (
         <div className="relative w-full h-full flex flex-col">
-          {/* ---------- Dynamic Video Grid ---------- */}
+          {/* ---------- Video Grid ---------- */}
           {(() => {
-            const totalUsers = Object.keys(peers).length + 1; // local + remote
+            const totalUsers = Object.keys(peers).length + 1;
             const gridCols =
               totalUsers === 1
                 ? "grid-cols-1 place-items-center"
@@ -231,39 +288,37 @@ export default function MultiVideoPage() {
               <div
                 className={`flex-1 grid ${gridCols} gap-4 p-6 transition-all duration-300`}
               >
-                {/* ---- Local Video ---- */}
+                {/* Local Video */}
                 <div
-                  className={`relative bg-black rounded-xl overflow-hidden border border-white/10
-                    ${
-                      totalUsers === 1
-                        ? "h-[80vh] w-full"
-                        : "h-[35vh] sm:h-[45vh]"
-                    }
-                  `}
+                  className={`relative bg-black rounded-xl overflow-hidden border border-white/10 ${
+                    totalUsers === 1 ? "h-[80vh] w-full" : "h-[35vh] sm:h-[45vh]"
+                  }`}
                 >
-                  <video
-                    ref={localVideoRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className="object-cover w-full h-full"
-                  />
+                  {isCameraOff ? (
+                    <div className="flex items-center justify-center h-full text-gray-400">
+                      <span>📷 Camera Off</span>
+                    </div>
+                  ) : (
+                    <video
+                      ref={localVideoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="object-cover w-full h-full"
+                    />
+                  )}
                   <span className="absolute bottom-2 left-2 text-xs bg-black/50 px-2 py-1 rounded">
                     You
                   </span>
                 </div>
 
-                {/* ---- Remote Videos ---- */}
+                {/* Remote Videos */}
                 {Object.entries(peers).map(([id, stream]) => (
                   <div
                     key={id}
-                    className={`relative bg-black rounded-xl overflow-hidden border border-white/10
-                      ${
-                        totalUsers <= 2
-                          ? "h-[70vh]"
-                          : "h-[35vh] sm:h-[45vh]"
-                      }
-                    `}
+                    className={`relative bg-black rounded-xl overflow-hidden border border-white/10 ${
+                      totalUsers <= 2 ? "h-[70vh]" : "h-[35vh] sm:h-[45vh]"
+                    }`}
                   >
                     <video
                       autoPlay
@@ -282,13 +337,40 @@ export default function MultiVideoPage() {
             );
           })()}
 
-          {/* ---------- End Call ---------- */}
-          <div className="absolute bottom-6 left-1/2 -translate-x-1/2">
+          {/* ---------- Controls ---------- */}
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4 bg-black/50 backdrop-blur-sm px-6 py-3 rounded-full">
+            <button
+              onClick={toggleMic}
+              className={`px-4 py-2 rounded-full ${
+                isMuted ? "bg-gray-600" : "bg-blue-600"
+              }`}
+            >
+              {isMuted ? "🎙️ Unmute" : "🔇 Mute"}
+            </button>
+
+            <button
+              onClick={toggleCamera}
+              className={`px-4 py-2 rounded-full ${
+                isCameraOff ? "bg-gray-600" : "bg-blue-600"
+              }`}
+            >
+              {isCameraOff ? "📷 On" : "📷 Off"}
+            </button>
+
+            <button
+              onClick={toggleScreenShare}
+              className={`px-4 py-2 rounded-full ${
+                isScreenSharing ? "bg-indigo-500" : "bg-indigo-600"
+              }`}
+            >
+              {isScreenSharing ? "🛑 Stop Share" : "🖥️ Share"}
+            </button>
+
             <button
               onClick={leaveRoom}
-              className="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-full font-medium"
+              className="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-full"
             >
-              End Call
+              ❌ End
             </button>
           </div>
         </div>
