@@ -1,17 +1,20 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
+import { useSearchParams, useParams } from "next/navigation";
 import { createClient } from "@/lib/Client";
 import { v4 as uuidv4 } from "uuid";
 
 const supabase = createClient();
 
 export default function MultiVideoPage() {
-  const [roomId, setRoomId] = useState("");
+  const searchParams = useSearchParams();
+  const params = useParams();
+
+  const [roomId, setRoomId] = useState<string | null>(null);
   const [joined, setJoined] = useState(false);
   const [peers, setPeers] = useState<{ [id: string]: MediaStream }>({});
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -21,48 +24,87 @@ export default function MultiVideoPage() {
   const peerId = useRef(uuidv4());
   const channelRef = useRef<any>(null);
 
-  // --- Setup Local Media ---
- const setupLocalStream = async () => {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true,
-    });
-    setLocalStream(stream);
+  // negotiation helpers
+  const makingOffer = useRef(false);
+  const isPolite = (remoteId: string) => peerId.current > remoteId;
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-    // wait for React to render video
-    setTimeout(() => {
+  // --- Detect roomId from URL (query ?room=xxx or dynamic /room/[id]) ---
+  useEffect(() => {
+    const fromQuery = searchParams.get("room");
+    const fromPath = params?.roomId as string | undefined;
+    const id = fromQuery || fromPath;
+    if (id) {
+      console.log("Detected Room ID:", id);
+      setRoomId(id);
+    }
+  }, [searchParams, params]);
+
+  // --- Setup Local Media ---
+  const setupLocalStream = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720 },
+        audio: true,
+      });
+
+      stream.getTracks().forEach((t) => (t.enabled = true));
+
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
+        await localVideoRef.current.play().catch(() => {});
       }
-    }, 100);
 
-    return stream;
-  } catch (err) {
-    console.error("Camera/mic permission denied:", err);
-    alert("Please allow camera and microphone access.");
-  }
-};
+      setLocalStream(stream);
+      return stream;
+    } catch (err) {
+      console.error("Camera/mic error:", err);
+      alert("Please allow camera and microphone access.");
+      return null;
+    }
+  };
 
+  // --- Negotiation Helper ---
+  const negotiate = async (pc: RTCPeerConnection, remoteId: string) => {
+    if (pc.signalingState !== "stable") return;
+    try {
+      makingOffer.current = true;
+      const offer = await pc.createOffer();
+      if (pc.signalingState !== "stable") return;
+      await pc.setLocalDescription(offer);
+      await sendSignal({
+        type: "offer",
+        from: peerId.current,
+        to: remoteId,
+        sdp: pc.localDescription,
+      });
+    } catch (err) {
+      console.error("Negotiation error:", err);
+    } finally {
+      makingOffer.current = false;
+    }
+  };
+
+  // --- ICE Server Config ---
+  const getIceServers = () => [
+    { urls: "stun:stun.l.google.com:19302" },
+    {
+      urls: "turn:relay.metered.ca:80",
+      username: "openai",
+      credential: "openai123",
+    },
+  ];
 
   // --- Create Peer Connection ---
   const createPeerConnection = (targetId: string, stream: MediaStream) => {
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        {
-          urls: "turn:relay.metered.ca:80",
-          username: "openai",
-          credential: "openai123",
-        },
-      ],
-    });
+    const pc = new RTCPeerConnection({ iceServers: getIceServers() });
 
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
 
     pc.ontrack = (event) => {
       const [remoteStream] = event.streams;
-      setPeers((prev) => ({ ...prev, [targetId]: remoteStream }));
+      if (remoteStream)
+        setPeers((prev) => ({ ...prev, [targetId]: remoteStream }));
     };
 
     pc.onicecandidate = (event) => {
@@ -76,15 +118,18 @@ export default function MultiVideoPage() {
       }
     };
 
-    pc.oniceconnectionstatechange = () =>
-      console.log(`ICE(${targetId}):`, pc.iceConnectionState);
+    pc.onnegotiationneeded = async () => {
+      if (makingOffer.current || pc.signalingState !== "stable") return;
+      await negotiate(pc, targetId);
+    };
 
     peerConnections.current[targetId] = pc;
     return pc;
   };
 
-  // --- Send Message through Supabase ---
+  // --- Send Signal ---
   const sendSignal = async (data: any) => {
+    if (!channelRef.current) return;
     await channelRef.current.send({
       type: "broadcast",
       event: "signal",
@@ -94,9 +139,14 @@ export default function MultiVideoPage() {
 
   // --- Join Room ---
   const joinRoom = async () => {
-    if (!roomId) return alert("Enter Room ID");
+    if (!roomId) return alert("No Room ID found in URL");
+    if (joined) return;
 
-    const stream : any = await setupLocalStream();
+    const stream = await setupLocalStream();
+    if (!stream) return;
+
+    await wait(200 + Math.random() * 200);
+
     const channel = supabase.channel(roomId, {
       config: { broadcast: { self: false } },
     });
@@ -105,52 +155,58 @@ export default function MultiVideoPage() {
     channel.on("broadcast", { event: "signal" }, async ({ payload }: any) => {
       const msg = JSON.parse(payload);
       if (!msg || msg.from === peerId.current) return;
+      if (msg.to && msg.to !== peerId.current) return;
 
       switch (msg.type) {
         case "join": {
           const pc = createPeerConnection(msg.from, stream);
-          const offer = await pc.createOffer({
-            offerToReceiveVideo: true,
-            offerToReceiveAudio: true,
-          });
-          await pc.setLocalDescription(offer);
-          sendSignal({
-            type: "offer",
-            from: peerId.current,
-            to: msg.from,
-            sdp: offer,
-          });
+          await negotiate(pc, msg.from);
           break;
         }
 
         case "offer": {
-          if (msg.to !== peerId.current) return;
-          const pc = createPeerConnection(msg.from, stream);
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          const remoteId = msg.from;
+          const polite = isPolite(remoteId);
+          const pc =
+            peerConnections.current[remoteId] ||
+            createPeerConnection(remoteId, stream);
+
+          const offerCollision =
+            makingOffer.current || pc.signalingState !== "stable";
+
+          if (offerCollision) {
+            if (polite) {
+              await Promise.all([
+                pc.setLocalDescription({ type: "rollback" }),
+                pc.setRemoteDescription(new RTCSessionDescription(msg.sdp)),
+              ]);
+            } else return;
+          } else {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          }
+
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
-          sendSignal({
+          await sendSignal({
             type: "answer",
             from: peerId.current,
-            to: msg.from,
-            sdp: answer,
+            to: remoteId,
+            sdp: pc.localDescription,
           });
           break;
         }
 
         case "answer": {
-          if (msg.to !== peerId.current) return;
           const pc = peerConnections.current[msg.from];
-          if (pc && !pc.currentRemoteDescription) {
-            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          }
+          if (!pc) return;
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
           break;
         }
 
         case "ice-candidate": {
-          if (msg.to !== peerId.current) return;
           const pc = peerConnections.current[msg.from];
-          if (pc) await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+          if (pc && msg.candidate)
+            await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
           break;
         }
 
@@ -172,10 +228,19 @@ export default function MultiVideoPage() {
       if (status === "SUBSCRIBED") {
         console.log("✅ Joined room:", roomId);
         setJoined(true);
-        sendSignal({ type: "join", from: peerId.current });
+        await wait(100);
+        await sendSignal({ type: "join", from: peerId.current });
       }
     });
   };
+
+  // Auto-join when roomId detected
+  useEffect(() => {
+    if (roomId && !joined) {
+      joinRoom();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId]);
 
   // --- Leave Room ---
   const leaveRoom = async () => {
@@ -190,51 +255,44 @@ export default function MultiVideoPage() {
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
   };
 
-  // --- Toggle Mic ---
+  // --- Toggle Mic / Camera / Screen ---
   const toggleMic = () => {
     if (!localStream) return;
-    localStream.getAudioTracks().forEach((track) => (track.enabled = !track.enabled));
-    setIsMuted((prev) => !prev);
-  };
-
-  // --- Toggle Camera ---
-  const toggleCamera = async () => {
-    if (!localStream) return;
-    const videoTrack = localStream.getVideoTracks()[0];
-    if (!isCameraOff) {
-      videoTrack.stop();
-      setIsCameraOff(true);
-    } else {
-      const newStream = await navigator.mediaDevices.getUserMedia({ video: true });
-      const newTrack = newStream.getVideoTracks()[0];
-      const sender = Object.values(peerConnections.current)
-        .map((pc) => pc.getSenders().find((s) => s.track?.kind === "video"))
-        .find(Boolean);
-      sender?.replaceTrack(newTrack);
-      localStream.removeTrack(videoTrack);
-      localStream.addTrack(newTrack);
-      if (localVideoRef.current) localVideoRef.current.srcObject = localStream;
-      setIsCameraOff(false);
+    const track = localStream.getAudioTracks()[0];
+    if (track) {
+      track.enabled = !track.enabled;
+      setIsMuted(!track.enabled);
     }
   };
 
-  // --- Screen Share ---
+  const toggleCamera = () => {
+    if (!localStream) return;
+    const track = localStream.getVideoTracks()[0];
+    if (track) {
+      track.enabled = !track.enabled;
+      setIsCameraOff(!track.enabled);
+    }
+  };
+
   const toggleScreenShare = async () => {
     if (!peerConnections.current) return;
-
     if (!isScreenSharing) {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+      });
       const screenTrack = screenStream.getVideoTracks()[0];
+      screenTrack.onended = () => toggleScreenShare();
+
       for (const pc of Object.values(peerConnections.current)) {
         const sender = pc.getSenders().find((s) => s.track?.kind === "video");
         sender?.replaceTrack(screenTrack);
       }
+
       if (localVideoRef.current) localVideoRef.current.srcObject = screenStream;
-      screenTrack.onended = () => toggleScreenShare();
       setIsScreenSharing(true);
     } else {
-      const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true });
-      const cameraTrack = cameraStream.getVideoTracks()[0];
+      if (!localStream) return;
+      const cameraTrack = localStream.getVideoTracks()[0];
       for (const pc of Object.values(peerConnections.current)) {
         const sender = pc.getSenders().find((s) => s.track?.kind === "video");
         sender?.replaceTrack(cameraTrack);
@@ -244,27 +302,52 @@ export default function MultiVideoPage() {
     }
   };
 
+  // --- Ensure local video attached (fix black screen) ---
+  useEffect(() => {
+    if (localVideoRef.current && localStream) {
+      localVideoRef.current.srcObject = localStream;
+      localVideoRef.current.play().catch(() => {});
+    }
+  }, [localStream]);
+
+  // Retry attachment (safety)
+  useEffect(() => {
+    let tries = 0;
+    const interval = setInterval(() => {
+      if (!localStream || !localVideoRef.current) return;
+      if (localVideoRef.current.srcObject !== localStream) {
+        console.log("Reattaching local video...");
+        localVideoRef.current.srcObject = localStream;
+        localVideoRef.current.play().catch(() => {});
+      }
+      tries++;
+      if (tries > 10) clearInterval(interval);
+    }, 500);
+    return () => clearInterval(interval);
+  }, [localStream]);
+
+  // --- Cleanup ---
+  useEffect(() => {
+    return () => {
+      localStream?.getTracks().forEach((t) => t.stop());
+      Object.values(peerConnections.current).forEach((pc) => pc.close());
+      channelRef.current?.unsubscribe?.();
+    };
+  }, []);
+
   // --- UI ---
   return (
     <div className="h-screen bg-[#202124] text-white flex flex-col items-center justify-center">
       {!joined ? (
         <div className="flex flex-col items-center gap-4">
           <h1 className="text-3xl font-semibold">🎥 Group Video Call</h1>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              placeholder="Enter Room ID"
-              value={roomId}
-              onChange={(e) => setRoomId(e.target.value)}
-              className="px-3 py-2 rounded text-black"
-            />
-            <button
-              onClick={joinRoom}
-              className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded"
-            >
-              Join Room
-            </button>
-          </div>
+          <p className="text-gray-400">Joining room: {roomId || "..."}</p>
+          <button
+            onClick={joinRoom}
+            className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded"
+          >
+            Join Room
+          </button>
         </div>
       ) : (
         <div className="relative w-full h-full flex flex-col">
@@ -272,16 +355,10 @@ export default function MultiVideoPage() {
           {(() => {
             const totalUsers = Object.keys(peers).length + 1;
             const gridCols =
-              totalUsers === 1
-                ? "grid-cols-1 place-items-center"
-                : totalUsers === 2
+              totalUsers <= 2
                 ? "grid-cols-2"
-                : totalUsers === 3
-                ? "grid-cols-2 sm:grid-cols-3"
                 : totalUsers <= 4
                 ? "grid-cols-2 sm:grid-cols-2"
-                : totalUsers <= 6
-                ? "grid-cols-3"
                 : "grid-cols-3 sm:grid-cols-4";
 
             return (
@@ -289,11 +366,7 @@ export default function MultiVideoPage() {
                 className={`flex-1 grid ${gridCols} gap-4 p-6 transition-all duration-300`}
               >
                 {/* Local Video */}
-                <div
-                  className={`relative bg-black rounded-xl overflow-hidden border border-white/10 ${
-                    totalUsers === 1 ? "h-[80vh] w-full" : "h-[35vh] sm:h-[45vh]"
-                  }`}
-                >
+                <div className="relative bg-black rounded-xl overflow-hidden border border-white/10 h-full">
                   {isCameraOff ? (
                     <div className="flex items-center justify-center h-full text-gray-400">
                       <span>📷 Camera Off</span>
@@ -316,15 +389,14 @@ export default function MultiVideoPage() {
                 {Object.entries(peers).map(([id, stream]) => (
                   <div
                     key={id}
-                    className={`relative bg-black rounded-xl overflow-hidden border border-white/10 ${
-                      totalUsers <= 2 ? "h-[70vh]" : "h-[35vh] sm:h-[45vh]"
-                    }`}
+                    className="relative bg-black rounded-xl overflow-hidden border border-white/10 h-full"
                   >
                     <video
                       autoPlay
                       playsInline
                       ref={(v) => {
-                        if (v && !v.srcObject) v.srcObject = stream;
+                        if (v && stream && v.srcObject !== stream)
+                          v.srcObject = stream;
                       }}
                       className="object-cover w-full h-full"
                     />
