@@ -265,14 +265,73 @@ export default function MultiVideoPage() {
     }
   };
 
-  const toggleCamera = () => {
-    if (!localStream) return;
-    const track = localStream.getVideoTracks()[0];
-    if (track) {
-      track.enabled = !track.enabled;
-      setIsCameraOff(!track.enabled);
+const toggleCamera = async () => {
+  if (!localStream) return;
+
+  if (!isCameraOff) {
+    // 🔴 TURN CAMERA OFF COMPLETELY
+    const videoTrack = localStream.getVideoTracks()[0];
+    if (videoTrack) {
+      videoTrack.stop(); // LED off
+      localStream.removeTrack(videoTrack);
+
+      for (const pc of Object.values(peerConnections.current)) {
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+        if (sender) await sender.replaceTrack(null);
+      }
+
+      // Clear local preview
+      if (localVideoRef.current) localVideoRef.current.srcObject = null;
+
+      setIsCameraOff(true);
     }
-  };
+  } else {
+    // 🟢 TURN CAMERA ON AGAIN
+    try {
+      // Small delay gives Chrome time to release webcam
+      await new Promise((r) => setTimeout(r, 300));
+
+      const newStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const newTrack = newStream.getVideoTracks()[0];
+
+      // Update local preview
+      const updatedStream = new MediaStream([
+        ...(localStream.getAudioTracks() || []),
+        newTrack,
+      ]);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = updatedStream;
+        await localVideoRef.current.play().catch(() => {});
+      }
+
+      setLocalStream(updatedStream);
+
+      // Replace the track in every peer connection
+      for (const pc of Object.values(peerConnections.current)) {
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+
+        if (sender) {
+          await sender.replaceTrack(newTrack);
+        } else {
+          // 🧠 In case peer connection lost sender reference
+          pc.addTrack(newTrack, updatedStream);
+        }
+
+        // ⚡ Force renegotiation so remote can receive new video
+        await negotiate(pc, /* remoteId */ Object.keys(peerConnections.current)[0]);
+      }
+
+      setIsCameraOff(false);
+    } catch (err) {
+      console.error("Error re-enabling camera:", err);
+      alert("Could not access camera again. Please allow permissions.");
+    }
+  }
+};
+
+
+
+
 
   const toggleScreenShare = async () => {
     if (!peerConnections.current) return;
@@ -363,7 +422,7 @@ export default function MultiVideoPage() {
 
             return (
               <div
-                className={`flex-1 grid ${gridCols} gap-4 p-6 transition-all duration-300`}
+                className={`flex-1 grid ${gridCols} gap-4 p-6 transition-all duration-300 bg-gray-600`}
               >
                 {/* Local Video */}
                 <div className="relative bg-black rounded-xl overflow-hidden border border-white/10 h-full">
@@ -389,7 +448,7 @@ export default function MultiVideoPage() {
                 {Object.entries(peers).map(([id, stream]) => (
                   <div
                     key={id}
-                    className="relative bg-black rounded-xl overflow-hidden border border-white/10 h-full"
+                    className="relative bg-black rounded-xl overflow-hidden border border-white/10"
                   >
                     <video
                       autoPlay
