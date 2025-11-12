@@ -23,7 +23,12 @@ export type UseVideoCallReturn = {
   toggleScreenShare: () => Promise<void>;
 };
 
-export function useVideoCall(): UseVideoCallReturn {
+export type UseVideoCallOptions = {
+  onUserJoin?: (id: string) => void;
+  onUserLeave?: (id: string) => void;
+};
+
+export function useVideoCall(opts?: UseVideoCallOptions): UseVideoCallReturn {
   const searchParams = useSearchParams();
   const params = useParams();
 
@@ -175,6 +180,11 @@ export function useVideoCall(): UseVideoCallReturn {
         case "join": {
           const pc = createPeerConnection(msg.from, stream);
           await negotiate(pc, msg.from);
+          try {
+            opts?.onUserJoin?.(msg.from);
+          } catch (e) {
+            console.warn("onUserJoin handler error", e);
+          }
           break;
         }
 
@@ -229,6 +239,11 @@ export function useVideoCall(): UseVideoCallReturn {
             delete updated[msg.from];
             return updated;
           });
+          try {
+            opts?.onUserLeave?.(msg.from);
+          } catch (e) {
+            console.warn("onUserLeave handler error", e);
+          }
           break;
         }
 
