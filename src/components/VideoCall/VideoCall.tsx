@@ -1,11 +1,23 @@
 "use client";
 
-import React from "react";
+import React, { useCallback, useState } from "react";
 import VideoGrid from "./VideoGrid";
 import ControlsBar from "./ControlsBar";
 import { useVideoCall } from "./useVideoCall";
+import Toaster from "./Toaster";
 
 export default function VideoCallContainer() {
+  const [toasts, setToasts] = useState<{ id: string; message: string }[]>([]);
+
+  const addToast = useCallback((message: string, ttl = 4000) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    setToasts((s) => [...s, { id, message }]);
+    setTimeout(() => setToasts((s) => s.filter((t) => t.id !== id)), ttl);
+    return id;
+  }, []);
+
+  const removeToast = useCallback((id: string) => setToasts((s) => s.filter((t) => t.id !== id)), []);
+
   const {
     localVideoRef,
     peers,
@@ -20,7 +32,10 @@ export default function VideoCallContainer() {
     toggleMic,
     toggleCamera,
     toggleScreenShare,
-  } = useVideoCall();
+  } = useVideoCall({
+    onUserJoin: (id) => addToast(`User ${id.slice(0, 5)} joined`),
+    onUserLeave: (id) => addToast(`User ${id.slice(0, 5)} left`),
+  });
 
   return (
     <div className="h-screen w-screen bg-gradient-to-br from-[#1b1c1e] to-[#2a2d31] text-white flex flex-col items-center justify-center overflow-hidden">
@@ -34,6 +49,7 @@ export default function VideoCallContainer() {
         <div className="relative flex flex-col h-full w-full overflow-hidden">
           <VideoGrid localVideoRef={localVideoRef} peers={peers} peerCameras={peerCameras} isCameraOff={isCameraOff} />
           <ControlsBar isMuted={isMuted} isCameraOff={isCameraOff} isScreenSharing={isScreenSharing} toggleMic={toggleMic} toggleCamera={toggleCamera} toggleScreenShare={toggleScreenShare} leaveRoom={leaveRoom} />
+          <Toaster toasts={toasts} removeToast={removeToast} />
         </div>
       )}
     </div>
