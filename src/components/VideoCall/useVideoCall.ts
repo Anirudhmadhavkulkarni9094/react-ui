@@ -394,6 +394,45 @@ export function useVideoCall(): UseVideoCallReturn {
     };
   }, []);
 
+  // Notify peers on tab close / unload / hide so they can remove this user quickly
+  useEffect(() => {
+    const sendLeaveNow = () => {
+      try {
+        // best-effort synchronous send via the channel object if available
+        if (channelRef.current?.send) {
+          channelRef.current.send({
+            type: "broadcast",
+            event: "signal",
+            payload: JSON.stringify({ type: "leave", from: peerId.current }),
+          });
+        }
+      } catch (e) {
+        // ignore — we're in unload path
+      }
+    };
+
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      sendLeaveNow();
+      // allow default behavior; not preventing unload
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        sendLeaveNow();
+      }
+    };
+
+    window.addEventListener("beforeunload", onBeforeUnload);
+    window.addEventListener("pagehide", sendLeaveNow as any);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      window.removeEventListener("pagehide", sendLeaveNow as any);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
+
   return {
     localVideoRef,
     peers,
