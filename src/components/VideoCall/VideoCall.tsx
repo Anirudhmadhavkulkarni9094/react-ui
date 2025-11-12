@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useState, useEffect } from "react";
 import VideoGrid from "./VideoGrid";
 import ControlsBar from "./ControlsBar";
 import { useVideoCall } from "./useVideoCall";
@@ -33,9 +33,23 @@ export default function VideoCallContainer() {
     toggleCamera,
     toggleScreenShare,
   } = useVideoCall({
-    onUserJoin: (id) => addToast(`User ${id.slice(0, 5)} joined`),
-    onUserLeave: (id) => addToast(`User ${id.slice(0, 5)} left`),
+    onUserJoin: (id) => {
+      console.debug("onUserJoin callback", id);
+      addToast(`User ${id.slice(0, 5)} joined`);
+    },
+    onUserLeave: (id) => {
+      console.debug("onUserLeave callback", id);
+      addToast(`User ${id.slice(0, 5)} left`);
+    },
   });
+
+  // sanity-check toast when local user joins
+  useEffect(() => {
+    if (joined) {
+      console.debug("local joined -> showing toast");
+      addToast("You joined the room");
+    }
+  }, [joined, addToast]);
 
   return (
     <div className="h-screen w-screen bg-gradient-to-br from-[#1b1c1e] to-[#2a2d31] text-white flex flex-col items-center justify-center overflow-hidden">
@@ -49,9 +63,10 @@ export default function VideoCallContainer() {
         <div className="relative flex flex-col h-full w-full overflow-hidden">
           <VideoGrid localVideoRef={localVideoRef} peers={peers} peerCameras={peerCameras} isCameraOff={isCameraOff} />
           <ControlsBar isMuted={isMuted} isCameraOff={isCameraOff} isScreenSharing={isScreenSharing} toggleMic={toggleMic} toggleCamera={toggleCamera} toggleScreenShare={toggleScreenShare} leaveRoom={leaveRoom} />
-          <Toaster toasts={toasts} removeToast={removeToast} />
         </div>
       )}
+      {/* Render toaster at root so it's always visible */}
+      <Toaster toasts={toasts} removeToast={removeToast} />
     </div>
   );
 }
