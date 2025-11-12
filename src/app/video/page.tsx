@@ -1,4 +1,4 @@
-import MultiVideoPage from '@/components/VideoCall'
+import VideoCallContainer from '@/components/VideoCall/VideoCall'
 import React, { Suspense } from 'react'
 
 function page() {
@@ -6,7 +6,7 @@ function page() {
     <div>
       <Suspense fallback={<div>Loading...</div>}>
 
-        <MultiVideoPage></MultiVideoPage>
+        <VideoCallContainer></VideoCallContainer>
       </Suspense>
     </div>
   )
